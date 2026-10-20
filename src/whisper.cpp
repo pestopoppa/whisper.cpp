@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <set>
@@ -165,6 +166,93 @@ static std::string format(const char * fmt, ...) {
 // ggml helpers
 //
 
+//
+// Persistent CPU threadpool (one per CPU backend), attached lazily by ggml_graph_compute_helper.
+//
+// Stock ggml builds and frees a disposable threadpool (n-1 pthread_create + join) on every
+// ggml_backend_graph_compute when the CPU backend has none attached. We create one pool sized to the
+// requested n_threads, attach it with ggml_backend_cpu_set_threadpool, reuse it for every compute
+// and free it with the backend (whisper_backend_free). If n_threads changes between computes the
+// pool is rebuilt (a plan asking for more threads than the pool has would be silently clamped).
+//
+//   WHISPER_THREADPOOL=0        disable (stock behaviour)
+//   WHISPER_THREADPOOL_POLL=<p> ggml_threadpool_params.poll (0-100). Idle workers busy-poll for
+//                               1024*128*p _mm_pause rounds before sleeping on the condvar. Default 0:
+//                               workers sleep immediately between computes. Other fields: paused=false,
+//                               strict_cpu=false, all-zero cpumask (inherits the caller's affinity),
+//                               prio=normal.
+//
+// One compute at a time per backend (already true: each whisper_state owns its backends).
+//
+struct whisper_cpu_pool {
+    ggml_threadpool_t pool = nullptr;
+    int               n_threads = 0;
+};
+
+static std::mutex & whisper_pool_mu() { static std::mutex m; return m; }
+static std::map<ggml_backend_t, whisper_cpu_pool> & whisper_pools() { static std::map<ggml_backend_t, whisper_cpu_pool> m; return m; }
+
+static void whisper_pool_free_locked(ggml_backend_reg_t reg, whisper_cpu_pool & p) {
+    auto * free_fn = (void (*)(ggml_threadpool_t)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    if (free_fn && p.pool) {
+        free_fn(p.pool);
+    }
+    p = {};
+}
+
+static void whisper_backend_ensure_pool(ggml_backend_t backend, ggml_backend_reg_t reg, int n_threads) {
+    const char * on = getenv("WHISPER_THREADPOOL");
+    if ((on && strcmp(on, "0") == 0) || n_threads < 2 || !reg) {
+        return;
+    }
+    auto * new_fn = (ggml_threadpool_t (*)(struct ggml_threadpool_params *)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto * set_fn = (void (*)(ggml_backend_t, ggml_threadpool_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+    if (!new_fn || !set_fn || !ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free")) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(whisper_pool_mu());
+    whisper_cpu_pool & p = whisper_pools()[backend];
+    if (p.pool && p.n_threads == n_threads) {
+        return;
+    }
+    if (p.pool) {
+        set_fn(backend, nullptr);
+        whisper_pool_free_locked(reg, p);
+    }
+
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    tpp.poll = 0;
+    if (const char * e = getenv("WHISPER_THREADPOOL_POLL")) {
+        const int v = atoi(e);
+        if (v >= 0 && v <= 100) {
+            tpp.poll = (uint32_t) v;
+        }
+    }
+    p.pool = new_fn(&tpp);
+    if (p.pool) {
+        p.n_threads = n_threads;
+        set_fn(backend, p.pool);
+    } else {
+        whisper_pools().erase(backend);
+    }
+}
+
+// Free the backend and the persistent pool attached to it (the backend never owns the pool).
+static void whisper_backend_free(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    ggml_backend_free(backend);
+    std::lock_guard<std::mutex> lk(whisper_pool_mu());
+    auto it = whisper_pools().find(backend);
+    if (it != whisper_pools().end()) {
+        if (reg) {
+            whisper_pool_free_locked(reg, it->second);
+        }
+        whisper_pools().erase(it);
+    }
+}
+
 static bool ggml_graph_compute_helper(
           struct ggml_cgraph * graph,
                          int   n_threads,
@@ -200,6 +288,9 @@ static bool ggml_graph_compute_helper(
         auto * fn_set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (fn_set_n_threads) {
             fn_set_n_threads(backend, n_threads);
+        }
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            whisper_backend_ensure_pool(backend, reg, n_threads);
         }
     }
 
@@ -3843,7 +3934,7 @@ void whisper_free_state(struct whisper_state * state) {
         ggml_backend_sched_free(state->sched_decode.sched);
 
         for (auto & backend : state->backends) {
-            ggml_backend_free(backend);
+            whisper_backend_free(backend);
         }
 
         // [EXPERIMENTAL] Token-level timestamps with DTW
@@ -5473,7 +5564,7 @@ void whisper_vad_free(whisper_vad_context * ctx) {
         ggml_backend_sched_free(ctx->sched.sched);
 
         for (auto & backend : ctx->backends) {
-            ggml_backend_free(backend);
+            whisper_backend_free(backend);
         }
 
         delete[] ctx->model.hparams.encoder_in_channels;
